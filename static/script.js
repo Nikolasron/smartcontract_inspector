@@ -14,35 +14,11 @@ const report = document.getElementById("report");
 const searchInput = document.getElementById("searchInput");
 
 let contracts = [];
-let nextStart = 0;
-let total = 0;
-let scanning = false;
-let finished = false;
 
-const BATCH_SIZE = 5;
-const MAX_START = 9990;
-
-function updateStats() {
-    processed.textContent = contracts.length;
-
-    highRisk.textContent = contracts.filter(
-        item => item.risk === "HIGH"
-    ).length;
-
-    mediumRisk.textContent = contracts.filter(
-        item => item.risk === "MEDIUM"
-    ).length;
-
-    totalContracts.textContent = Number(total).toLocaleString();
-
-    const percentage = total > 0
-        ? Math.min(100, (nextStart / total) * 100)
-        : 0;
-
-    progressBar.style.width = percentage + "%";
-
-    progressText.textContent =
-        `${contracts.length} processed | ${percentage.toFixed(1)}% indexed progress`;
+function setText(element, value) {
+    if (element) {
+        element.textContent = value;
+    }
 }
 
 function createCell(value) {
@@ -52,24 +28,26 @@ function createCell(value) {
 }
 
 function showReport(item) {
+    if (!report) return;
+
     report.replaceChildren();
 
     const title = document.createElement("h3");
     title.textContent = item.name || "Unknown contract";
 
     const address = document.createElement("p");
-    address.textContent = "Address: " + item.address;
+    address.textContent = "Address: " + (item.address || "Unknown");
 
     const risk = document.createElement("p");
-    risk.textContent = "Risk classification: " + item.risk;
+    risk.textContent = "Risk classification: " + (item.risk || "UNASSESSED");
 
     const status = document.createElement("p");
-    status.textContent = "Scan status: " + item.status;
+    status.textContent = "Scan status: " + (item.status || "Unknown");
 
     const source = document.createElement("p");
     source.textContent = item.source_available
-        ? "Verified Solidity source analyzed."
-        : "Source code unavailable; security analysis not completed.";
+        ? "Verified Solidity source was retrieved and analyzed."
+        : "Source code unavailable. Security analysis was not completed.";
 
     report.append(title, address, risk, status, source);
 
@@ -81,7 +59,7 @@ function showReport(item) {
         const message = document.createElement("p");
 
         message.textContent = item.source_available
-            ? "No suspicious patterns detected by the current scanner. This is not proof of security."
+            ? "No suspicious patterns were detected by the current scanner. This does not prove the contract is secure."
             : "No findings available because source code could not be retrieved.";
 
         report.appendChild(message);
@@ -92,7 +70,10 @@ function showReport(item) {
             const li = document.createElement("li");
 
             li.textContent =
-                `[${finding.severity}] ${finding.title}: ${finding.description}`;
+                `[${finding.severity || "UNKNOWN"}] ` +
+                (finding.code || "Finding") +
+                ": " +
+                (finding.message || "Review required.");
 
             list.appendChild(li);
         });
@@ -100,17 +81,24 @@ function showReport(item) {
         report.appendChild(list);
     }
 
-    const link = document.createElement("a");
-    link.href = item.explorer;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-    link.textContent = "View contract on TRONSCAN";
+    if (item.explorer_url) {
+        const link = document.createElement("a");
 
-    report.appendChild(link);
+        link.href = item.explorer_url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = "View contract on TRONSCAN";
+
+        report.appendChild(link);
+    }
 }
 
 function renderContracts() {
-    const query = searchInput.value.toLowerCase().trim();
+    if (!contractResults) return;
+
+    const query = searchInput
+        ? searchInput.value.toLowerCase().trim()
+        : "";
 
     contractResults.replaceChildren();
 
@@ -124,7 +112,7 @@ function renderContracts() {
         const cell = document.createElement("td");
 
         cell.colSpan = 5;
-        cell.textContent = "No matching contracts found.";
+        cell.textContent = "No saved contracts found.";
 
         row.appendChild(cell);
         contractResults.appendChild(row);
@@ -152,93 +140,95 @@ function renderContracts() {
     });
 }
 
-async function fetchBatch() {
-    const response = await fetch(
-        `/api/scan?start=${nextStart}&limit=${BATCH_SIZE}`,
-        {
-            method: "GET",
-            headers: {
-                "Accept": "application/json"
-            }
-        }
+function updateStats() {
+    setText(processed, contracts.length);
+
+    setText(
+        highRisk,
+        contracts.filter(item => item.risk === "HIGH").length
     );
 
-    const data = await response.json();
+    setText(
+        mediumRisk,
+        contracts.filter(item => item.risk === "MEDIUM").length
+    );
 
-    if (!response.ok) {
-        throw new Error(data.error || "TRONSCAN request failed.");
+    // This dashboard displays saved reports, not the total
+    // number of contracts available on TRONSCAN.
+    setText(totalContracts, "Saved reports");
+
+    if (progressBar) {
+        progressBar.style.width = "0%";
     }
 
-    return data;
+    setText(
+        progressText,
+        `${contracts.length} saved reports loaded`
+    );
 }
 
-function wait(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-async function startAutomaticDiscovery() {
-    if (scanning || finished) return;
-
-    scanning = true;
-    systemStatus.textContent = "Automatic scanner running";
-
+async function loadDashboard() {
     try {
-        while (nextStart <= MAX_START) {
-            scanActivity.textContent =
-                `Discovering verified contracts from index ${nextStart}...`;
+        setText(systemStatus, "Connecting to saved reports...");
+        setText(scanActivity, "Loading stored contract reports...");
 
-            const data = await fetchBatch();
+        const statusResponse = await fetch("/api/status", {
+            headers: { "Accept": "application/json" },
+            cache: "no-store"
+        });
 
-            total = Number(data.total_verified || 0);
-
-            if (!Array.isArray(data.reports) || data.reports.length === 0) {
-                finished = true;
-                break;
-            }
-
-            contracts.push(...data.reports);
-
-            nextStart = Number(data.next_start);
-
-            updateStats();
-            renderContracts();
-
-            scanActivity.textContent =
-                `Analyzed ${contracts.length} contracts. Fetching next batch...`;
-
-            if (nextStart > MAX_START || nextStart >= total) {
-                finished = true;
-                break;
-            }
-
-            await wait(1000);
+        if (!statusResponse.ok) {
+            throw new Error(
+                `Status request failed: HTTP ${statusResponse.status}`
+            );
         }
 
-        systemStatus.textContent = finished
-            ? "Current discovery range completed"
-            : "Scanner stopped";
+        const statusData = await statusResponse.json();
 
-        scanActivity.textContent = finished
-            ? "Discovery of the available indexed range is complete."
-            : "Discovery paused.";
+        const reportsResponse = await fetch("/api/reports", {
+            headers: { "Accept": "application/json" },
+            cache: "no-store"
+        });
+
+        if (!reportsResponse.ok) {
+            throw new Error(
+                `Reports request failed: HTTP ${reportsResponse.status}`
+            );
+        }
+
+        const reportsData = await reportsResponse.json();
+
+        contracts = Array.isArray(reportsData.reports)
+            ? reportsData.reports
+            : [];
+
+        updateStats();
+        renderContracts();
+
+        setText(systemStatus, "Connected — displaying saved reports");
+
+        const lastRun = statusData.last_cron_run
+            ? new Date(statusData.last_cron_run).toLocaleString()
+            : "No scheduled scan recorded yet";
+
+        setText(
+            scanActivity,
+            `Last scheduled scan: ${lastRun}. Dashboard refreshes automatically.`
+        );
 
     } catch (error) {
-        systemStatus.textContent = "Scanner connection error";
-        scanActivity.textContent = error.message;
-
-    } finally {
-        scanning = false;
+        setText(systemStatus, "Dashboard connection error");
+        setText(scanActivity, error.message);
     }
 }
 
-searchInput.addEventListener("input", renderContracts);
-
-// Automatically start when the dashboard loads.
-document.addEventListener("DOMContentLoaded", () => {
-    startAutomaticDiscovery();
-});
-
-// Also support scripts loaded after DOMContentLoaded.
-if (document.readyState !== "loading") {
-    startAutomaticDiscovery();
+if (searchInput) {
+    searchInput.addEventListener("input", renderContracts);
 }
+
+// Load saved results when the page opens.
+// This dashboard does not call TRONSCAN or start scans.
+loadDashboard();
+
+// Refresh saved results every 30 seconds.
+setInterval(loadDashboard, 30000);
