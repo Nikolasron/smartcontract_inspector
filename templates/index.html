@@ -1,0 +1,72 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Contract Security Scanner</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+    <header>
+        <h1>Smart Contract Security Scanner</h1>
+        <p>Automated Solidity Security Analysis</p>
+    </header>
+
+    <main class="container">
+
+        <section class="scanner">
+            <h2>Scan Smart Contract</h2>
+
+            <form id="scanForm">
+                <label for="contract">Paste Solidity Contract Code</label>
+
+                <textarea
+                    id="contract"
+                    name="contract"
+                    placeholder="Paste your Solidity smart contract code here..."
+                    required
+                ></textarea>
+
+                <button type="submit" id="scanButton">
+                    Scan Contract
+                </button>
+            </form>
+        </section>
+
+        <section class="results">
+            <h2>Security Analysis Results</h2>
+
+            <div id="loading" hidden>
+                Scanning contract...
+            </div>
+
+            <div id="results">
+                <p>Your scan results will appear here.</p>
+            </div>
+        </section>
+
+        <section class="features">
+            <h2>Detection Capabilities</h2>
+
+            <ul>
+                <li>Reentrancy vulnerabilities</li>
+                <li>Unsafe external calls</li>
+                <li>Missing access controls</li>
+                <li>Unchecked return values</li>
+                <li>Integer overflow and underflow patterns</li>
+                <li>Dangerous Solidity functions</li>
+            </ul>
+        </section>
+
+    </main>
+
+    <footer>
+        <p>Smart Contract Security Scanner | Security Research Tool</p>
+    </footer>
+
+    <script src="/static/script.js"></script>
+
+</body>
+</html>
