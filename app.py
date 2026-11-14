@@ -1,68 +1,226 @@
 
-from flask import Flask, render_template, request, jsonify
+import os
 import re
+import time
+import requests
+
+from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
 
-MAX_CODE_SIZE = 500_000
+TRONSCAN_URL = "https://apilist.tronscanapi.com"
+API_KEY = os.getenv("TRONSCAN_API_KEY", "")
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "Accept": "application/json",
+    "User-Agent": "TRON-Contract-Intelligence/1.0"
+})
+
+if API_KEY:
+    SESSION.headers["TRON-PRO-API-KEY"] = API_KEY
+
+MAX_LIMIT = 10
+MAX_START = 9990
+REQUEST_TIMEOUT = 15
 
 
-def analyze_contract(code):
+def tronscan_get(path, params):
+    response = SESSION.get(
+        TRONSCAN_URL + path,
+        params=params,
+        timeout=REQUEST_TIMEOUT
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_verified_contracts(start=0, limit=10):
+    start = max(0, min(int(start), MAX_START))
+    limit = max(1, min(int(limit), MAX_LIMIT))
+
+    data = tronscan_get(
+        "/api/contracts",
+        {
+            "start": start,
+            "limit": limit,
+            "sort": "-timestamp",
+            "verified-only": "true",
+            "open-source-only": "true"
+        }
+    )
+
+    contracts = data.get("data", [])
+
+    # Only fully verified contracts are accepted.
+    contracts = [
+        item for item in contracts
+        if item.get("verify_status") == 2
+        and item.get("address")
+    ]
+
+    return {
+        "contracts": contracts,
+        "total": data.get("rangeTotal", data.get("total", 0)),
+        "next_start": start + limit
+    }
+
+
+def find_source_fields(obj, depth=0):
+    """Find source-code fields in returned API objects."""
+
+    if depth > 5:
+        return None
+
+    if isinstance(obj, dict):
+        for key in (
+            "sourceCode",
+            "source_code",
+            "source",
+            "contractCode",
+            "contract_code"
+        ):
+            value = obj.get(key)
+
+            if isinstance(value, str) and (
+                "pragma solidity" in value
+                or "contract " in value
+                or "interface " in value
+                or "library " in value
+            ):
+                return value
+
+        for value in obj.values():
+            result = find_source_fields(value, depth + 1)
+            if result:
+                return result
+
+    elif isinstance(obj, list):
+        for value in obj:
+            result = find_source_fields(value, depth + 1)
+            if result:
+                return result
+
+    return None
+
+
+def fetch_contract_source(address):
+    """
+    Try documented TRONSCAN contract detail/code endpoints.
+    Do not treat bytecode or ABI as Solidity source.
+    """
+
+    endpoints = [
+        ("/api/contract", {"contract": address}),
+        ("/api/contracts/code", {"contract": address})
+    ]
+
+    for path, params in endpoints:
+        try:
+            result = tronscan_get(path, params)
+            source = find_source_fields(result)
+
+            if source:
+                return source
+
+        except requests.RequestException:
+            continue
+
+    return None
+
+
+def add_finding(findings, severity, title, description):
+    findings.append({
+        "severity": severity,
+        "title": title,
+        "description": description
+    })
+
+
+def analyze_solidity(source):
     findings = []
 
-    def add_finding(severity, title, description):
-        findings.append({
-            "severity": severity,
-            "title": title,
-            "description": description
-        })
+    # Reentrancy-related patterns
+    if re.search(r'\.call\s*\{[^}]*value\s*:', source):
+        add_finding(
+            findings,
+            "HIGH",
+            "External value call",
+            "Review whether state changes occur before this external "
+            "call and whether reentrancy protection is required."
+        )
 
-    # 1. Reentrancy patterns
-    if re.search(r'\.call\s*\{[^}]*value\s*:', code):
-        if re.search(
-            r'\.call\s*\{[^}]*value\s*:[\s\S]*?\n[\s\S]{0,500}'
-            r'(balances|balanceOf|withdraw)',
-            code
-        ):
-            add_finding(
-                "HIGH",
-                "Possible Reentrancy",
-                "An external value-transfer call may occur before "
-                "related state updates. Review checks-effects-interactions."
-            )
+    # Delegatecall
+    if re.search(r'\.delegatecall\s*\(', source):
+        add_finding(
+            findings,
+            "HIGH",
+            "Delegatecall detected",
+            "Review target validation, storage layout and access controls."
+        )
 
-    # 2. Unprotected self-destruct
-    if re.search(r'\bselfdestruct\s*\(', code):
-        if not re.search(
-            r'onlyOwner|onlyRole|hasRole|msg\.sender\s*==',
-            code
-        ):
-            add_finding(
-                "HIGH",
-                "Potentially Unprotected Selfdestruct",
-                "The contract uses selfdestruct but no obvious "
-                "access-control pattern was detected."
-            )
+    # tx.origin
+    if re.search(r'\btx\.origin\b', source):
+        add_finding(
+            findings,
+            "MEDIUM",
+            "tx.origin usage",
+            "Review whether tx.origin is used for authorization."
+        )
 
-    # 3. Missing access-control patterns
-    sensitive_functions = [
+    # Selfdestruct
+    if re.search(r'\bselfdestruct\s*\(', source):
+        add_finding(
+            findings,
+            "HIGH",
+            "Selfdestruct detected",
+            "Review authorization and intended contract lifecycle."
+        )
+
+    # Dangerous low-level calls
+    if re.search(r'\.call\s*\(', source):
+        add_finding(
+            findings,
+            "MEDIUM",
+            "Low-level call detected",
+            "Check return-value handling and destination validation."
+        )
+
+    # Assembly
+    if re.search(r'\bassembly\b', source):
+        add_finding(
+            findings,
+            "INFO",
+            "Inline assembly detected",
+            "Manual review of memory and storage operations is advised."
+        )
+
+    # Unchecked blocks
+    if re.search(r'\bunchecked\s*\{', source):
+        add_finding(
+            findings,
+            "MEDIUM",
+            "Unchecked arithmetic",
+            "Review arithmetic operations for overflow and underflow."
+        )
+
+    # Sensitive functions without obvious modifiers
+    sensitive = [
         "withdraw",
         "mint",
         "pause",
-        "upgradeTo",
         "setOwner",
-        "setAdmin"
+        "setAdmin",
+        "upgradeTo"
     ]
 
-    for function in sensitive_functions:
+    for function in sensitive:
         pattern = (
             r'function\s+' + re.escape(function) +
             r'\s*\([^)]*\)[^{;]*\{'
         )
 
-        matches = list(re.finditer(pattern, code))
-
-        for match in matches:
+        for match in re.finditer(pattern, source):
             header = match.group(0)
 
             if not re.search(
@@ -71,132 +229,71 @@ def analyze_contract(code):
                 header
             ):
                 add_finding(
+                    findings,
                     "MEDIUM",
-                    "Review Access Control: " + function,
-                    "The function does not show a recognized "
-                    "access-control modifier in its declaration. "
-                    "Inspect its full implementation."
+                    "Review access control: " + function,
+                    "No recognized access-control pattern was found "
+                    "in the function declaration."
                 )
 
-    # 4. Dangerous delegatecall
-    if re.search(r'\.delegatecall\s*\(', code):
+    # Older compiler versions
+    if re.search(r'pragma\s+solidity\s+0\.[0-7]\.', source):
         add_finding(
-            "HIGH",
-            "Delegatecall Detected",
-            "delegatecall executes code in the caller's storage context. "
-            "Review target validation and authorization."
-        )
-
-    # 5. Unchecked low-level calls
-    if re.search(r'\.call\s*\(', code):
-        if not re.search(
-            r'(success|ok)\s*(,|=)',
-            code
-        ):
-            add_finding(
-                "MEDIUM",
-                "Review Low-Level Call Result",
-                "A low-level call exists. Verify that its success "
-                "return value is checked."
-            )
-
-    # 6. tx.origin authentication
-    if re.search(r'tx\.origin', code):
-        add_finding(
-            "MEDIUM",
-            "tx.origin Usage",
-            "tx.origin is present. Avoid using it as the primary "
-            "authorization mechanism."
-        )
-
-    # 7. Solidity version
-    if re.search(r'pragma\s+solidity\s+0\.[0-7]\.', code):
-        add_finding(
-            "MEDIUM",
-            "Older Solidity Version",
-            "An older Solidity compiler version is specified. "
-            "Review known compiler bugs and upgrade compatibility."
-        )
-
-    # 8. Floating pragma
-    if re.search(r'pragma\s+solidity\s+\^', code):
-        add_finding(
+            findings,
             "LOW",
-            "Floating Compiler Version",
-            "A floating compiler pragma is used. Pin a tested "
-            "compiler version for reproducible builds."
+            "Older Solidity compiler",
+            "Review compiler compatibility and known compiler bugs."
         )
 
-    # 9. Block timestamp dependency
-    if re.search(r'block\.timestamp', code):
-        add_finding(
-            "LOW",
-            "Block Timestamp Dependency",
-            "The contract uses block.timestamp. Avoid relying on "
-            "precise timestamps for sensitive randomness or timing."
+    return findings
+
+
+def get_risk(findings):
+    severities = {item["severity"] for item in findings}
+
+    if "HIGH" in severities:
+        return "HIGH"
+
+    if "MEDIUM" in severities:
+        return "MEDIUM"
+
+    if "LOW" in severities:
+        return "LOW"
+
+    return "INFO"
+
+
+def scan_contract(contract):
+    address = contract["address"]
+
+    report = {
+        "address": address,
+        "name": contract.get("name", "Unknown"),
+        "verified": True,
+        "source_available": False,
+        "status": "SOURCE_UNAVAILABLE",
+        "risk": "UNASSESSED",
+        "findings": [],
+        "explorer": (
+            "https://tronscan.org/#/contract/" + address
         )
-
-    # 10. Unchecked arithmetic in older Solidity
-    if re.search(r'pragma\s+solidity\s+0\.[0-7]\.', code):
-        if re.search(r'\bunchecked\s*\{', code):
-            add_finding(
-                "MEDIUM",
-                "Unchecked Arithmetic",
-                "An unchecked arithmetic block was detected. "
-                "Review possible integer underflow and overflow."
-            )
-
-    # 11. Assembly usage
-    if re.search(r'\bassembly\b', code):
-        add_finding(
-            "INFO",
-            "Inline Assembly Detected",
-            "Review assembly blocks manually for memory, storage "
-            "and call-safety issues."
-        )
-
-    # 12. Arbitrary external call targets
-    if re.search(r'\.call\s*\(', code):
-        if re.search(r'address\s*\([^)]*\)\s*\.call', code):
-            add_finding(
-                "HIGH",
-                "Dynamic External Call Target",
-                "A dynamically selected address may be used as a "
-                "low-level call target. Verify target restrictions."
-            )
-
-    # Remove duplicate findings
-    unique_findings = []
-    seen = set()
-
-    for finding in findings:
-        key = (finding["title"], finding["description"])
-
-        if key not in seen:
-            seen.add(key)
-            unique_findings.append(finding)
-
-    severity_counts = {
-        "HIGH": 0,
-        "MEDIUM": 0,
-        "LOW": 0,
-        "INFO": 0
     }
 
-    for finding in unique_findings:
-        severity_counts[finding["severity"]] += 1
+    source = fetch_contract_source(address)
 
-    return {
-        "summary": (
-            f"Analysis completed. "
-            f"{len(unique_findings)} potential findings detected. "
-            f"High: {severity_counts['HIGH']}, "
-            f"Medium: {severity_counts['MEDIUM']}, "
-            f"Low: {severity_counts['LOW']}, "
-            f"Info: {severity_counts['INFO']}."
-        ),
-        "findings": unique_findings
-    }
+    if not source:
+        return report
+
+    report["source_available"] = True
+    report["status"] = "SCANNED"
+
+    findings = analyze_solidity(source)
+
+    report["findings"] = findings
+    report["risk"] = get_risk(findings)
+    report["finding_count"] = len(findings)
+
+    return report
 
 
 @app.route("/")
@@ -204,39 +301,63 @@ def home():
     return render_template("index.html")
 
 
-@app.route("/scan", methods=["POST"])
-def scan():
-    data = request.get_json(silent=True)
+@app.route("/api/scan")
+def scan_batch():
+    try:
+        start = int(request.args.get("start", 0))
+        limit = int(request.args.get("limit", 5))
 
-    if not isinstance(data, dict):
-        return jsonify({"error": "Invalid JSON request."}), 400
+        if start < 0 or start > MAX_START:
+            return jsonify({"error": "Invalid pagination offset."}), 400
 
-    code = data.get("contract", "")
+        if limit < 1 or limit > MAX_LIMIT:
+            return jsonify({
+                "error": "Batch size must be between 1 and 10."
+            }), 400
 
-    if not isinstance(code, str):
-        return jsonify({"error": "Contract code must be text."}), 400
+        batch = fetch_verified_contracts(start, limit)
 
-    code = code.strip()
+        reports = []
 
-    if not code:
-        return jsonify({"error": "Contract code is empty."}), 400
+        for contract in batch["contracts"]:
+            reports.append(scan_contract(contract))
+            time.sleep(0.15)
 
-    if len(code) > MAX_CODE_SIZE:
-        return jsonify({"error": "Contract code is too large."}), 413
+        return jsonify({
+            "network": "TRON Mainnet",
+            "total_verified": batch["total"],
+            "start": start,
+            "next_start": batch["next_start"],
+            "processed": len(reports),
+            "reports": reports
+        })
 
-    result = analyze_contract(code)
+    except requests.HTTPError as error:
+        status = (
+            error.response.status_code
+            if error.response is not None else 502
+        )
 
-    return jsonify(result)
+        return jsonify({
+            "error": "TRONSCAN API request failed.",
+            "upstream_status": status
+        }), 502
+
+    except requests.RequestException:
+        return jsonify({
+            "error": "Unable to connect to TRONSCAN."
+        }), 502
+
+    except (ValueError, TypeError):
+        return jsonify({
+            "error": "Invalid request parameters."
+        }), 400
 
 
 @app.errorhandler(500)
-def internal_error(error):
+def server_error(error):
     return jsonify({"error": "Internal server error."}), 500
 
 
 if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=5000,
-        debug=False
-    )
+    app.run(host="0.0.0.0", port=5000)
