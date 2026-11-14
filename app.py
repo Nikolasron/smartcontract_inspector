@@ -1,255 +1,308 @@
 
 import os
 import re
-import time
-import requests
+import json
+import hmac
+from datetime import datetime, timezone
 
+import requests
 from flask import Flask, jsonify, render_template, request
+from upstash_redis import Redis
 
 app = Flask(__name__)
 
+# Configuration
 TRONSCAN_URL = "https://apilist.tronscanapi.com"
-API_KEY = os.getenv("TRONSCAN_API_KEY", "")
+TRONSCAN_API_KEY = os.getenv("TRONSCAN_API_KEY", "")
+CRON_SECRET = os.getenv("CRON_SECRET", "")
 
-SESSION = requests.Session()
-SESSION.headers.update({
+BATCH_SIZE = 5
+MAX_TRONSCAN_INDEX = 10000
+MAX_SAVED_REPORTS = 500
+
+REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+
+redis = None
+if REDIS_URL and REDIS_TOKEN:
+    redis = Redis(url=REDIS_URL, token=REDIS_TOKEN)
+
+session = requests.Session()
+session.headers.update({
     "Accept": "application/json",
     "User-Agent": "TRON-Contract-Intelligence/1.0"
 })
 
-if API_KEY:
-    SESSION.headers["TRON-PRO-API-KEY"] = API_KEY
-
-MAX_LIMIT = 10
-MAX_START = 9990
-REQUEST_TIMEOUT = 15
+if TRONSCAN_API_KEY:
+    session.headers["TRON-PRO-API-KEY"] = TRONSCAN_API_KEY
 
 
-def tronscan_get(path, params):
-    response = SESSION.get(
-        TRONSCAN_URL + path,
-        params=params,
-        timeout=REQUEST_TIMEOUT
+# Database helpers
+def database_ready():
+    return redis is not None
+
+
+def save_value(key, value):
+    redis.set(key, json.dumps(value))
+
+
+def read_value(key, default=None):
+    value = redis.get(key)
+
+    if value is None:
+        return default
+
+    if isinstance(value, (dict, list)):
+        return value
+
+    try:
+        return json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return default
+
+
+def save_report(report):
+    address = report["address"]
+    save_value("tron:report:" + address, report)
+
+    addresses = read_value("tron:report_addresses", [])
+
+    if address in addresses:
+        addresses.remove(address)
+
+    addresses.insert(0, address)
+    save_value(
+        "tron:report_addresses",
+        addresses[:MAX_SAVED_REPORTS]
     )
-    response.raise_for_status()
-    return response.json()
 
 
-def fetch_verified_contracts(start=0, limit=10):
-    start = max(0, min(int(start), MAX_START))
-    limit = max(1, min(int(limit), MAX_LIMIT))
+def get_saved_reports():
+    addresses = read_value("tron:report_addresses", [])
+    reports = []
 
-    data = tronscan_get(
-        "/api/contracts",
-        {
+    for address in addresses:
+        report = read_value("tron:report:" + address)
+        if report:
+            reports.append(report)
+
+    return reports
+
+
+# Discover verified contracts
+def fetch_verified_contracts(start=0, limit=BATCH_SIZE):
+    if not TRONSCAN_API_KEY:
+        raise RuntimeError("TRONSCAN_API_KEY is not configured.")
+
+    start = max(0, min(int(start), MAX_TRONSCAN_INDEX - 1))
+    limit = max(1, min(int(limit), 10))
+
+    response = session.get(
+        TRONSCAN_URL + "/api/contracts",
+        params={
             "start": start,
             "limit": limit,
             "sort": "-timestamp",
             "verified-only": "true",
             "open-source-only": "true"
-        }
+        },
+        timeout=15
     )
 
-    contracts = data.get("data", [])
+    response.raise_for_status()
+    payload = response.json()
 
-    # Only fully verified contracts are accepted.
-    contracts = [
-        item for item in contracts
-        if item.get("verify_status") == 2
-        and item.get("address")
-    ]
+    contracts = payload.get("data", [])
 
-    return {
-        "contracts": contracts,
-        "total": data.get("rangeTotal", data.get("total", 0)),
-        "next_start": start + limit
-    }
+    if not isinstance(contracts, list):
+        raise RuntimeError("Unexpected TRONSCAN response.")
+
+    return contracts, payload
 
 
-def find_source_fields(obj, depth=0):
-    """Find source-code fields in returned API objects."""
-
-    if depth > 5:
+# Extract actual Solidity source only
+def extract_source(value, depth=0):
+    if depth > 8:
         return None
 
-    if isinstance(obj, dict):
-        for key in (
-            "sourceCode",
-            "source_code",
-            "source",
-            "contractCode",
-            "contract_code"
+    source_keys = {
+        "sourcecode",
+        "source_code",
+        "contract_source",
+        "source",
+        "soliditysource",
+        "solidity_source"
+    }
+
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key.lower() in source_keys:
+                result = extract_source(item, depth + 1)
+                if result:
+                    return result
+
+        for item in value.values():
+            result = extract_source(item, depth + 1)
+            if result:
+                return result
+
+    elif isinstance(value, list):
+        for item in value:
+            result = extract_source(item, depth + 1)
+            if result:
+                return result
+
+    elif isinstance(value, str):
+        text = value.strip()
+
+        if (
+            "pragma solidity" in text
+            or "contract " in text
+            or "interface " in text
+            or "library " in text
         ):
-            value = obj.get(key)
-
-            if isinstance(value, str) and (
-                "pragma solidity" in value
-                or "contract " in value
-                or "interface " in value
-                or "library " in value
-            ):
-                return value
-
-        for value in obj.values():
-            result = find_source_fields(value, depth + 1)
-            if result:
-                return result
-
-    elif isinstance(obj, list):
-        for value in obj:
-            result = find_source_fields(value, depth + 1)
-            if result:
-                return result
+            return text
 
     return None
 
 
 def fetch_contract_source(address):
-    """
-    Try documented TRONSCAN contract detail/code endpoints.
-    Do not treat bytecode or ABI as Solidity source.
-    """
-
     endpoints = [
-        ("/api/contract", {"contract": address}),
-        ("/api/contracts/code", {"contract": address})
+        "/api/contract",
+        "/api/contracts/code"
     ]
 
-    for path, params in endpoints:
+    for endpoint in endpoints:
         try:
-            result = tronscan_get(path, params)
-            source = find_source_fields(result)
+            response = session.get(
+                TRONSCAN_URL + endpoint,
+                params={"contract": address},
+                timeout=15
+            )
+
+            response.raise_for_status()
+            payload = response.json()
+
+            source = extract_source(payload)
 
             if source:
                 return source
 
-        except requests.RequestException:
+        except (requests.RequestException, ValueError):
             continue
 
     return None
 
 
-def add_finding(findings, severity, title, description):
-    findings.append({
-        "severity": severity,
-        "title": title,
-        "description": description
-    })
-
-
+# Solidity security checks
 def analyze_solidity(source):
     findings = []
 
-    # Reentrancy-related patterns
-    if re.search(r'\.call\s*\{[^}]*value\s*:', source):
-        add_finding(
-            findings,
-            "HIGH",
-            "External value call",
-            "Review whether state changes occur before this external "
-            "call and whether reentrancy protection is required."
+    checks = [
+        (
+            "REENTRANCY_REVIEW",
+            r"\.call\s*\{[^}]*value\s*:",
+            "External value call detected. Review reentrancy protection.",
+            "HIGH"
+        ),
+        (
+            "DELEGATECALL",
+            r"\.delegatecall\s*\(",
+            "delegatecall detected. Review target control and storage compatibility.",
+            "HIGH"
+        ),
+        (
+            "TX_ORIGIN",
+            r"\btx\.origin\b",
+            "tx.origin detected. Review authorization logic.",
+            "MEDIUM"
+        ),
+        (
+            "SELFDESTRUCT",
+            r"\bselfdestruct\s*\(",
+            "Self-destruct operation detected. Review access restrictions.",
+            "HIGH"
+        ),
+        (
+            "LOW_LEVEL_CALL",
+            r"\.call\s*\(",
+            "Low-level call detected. Review return-value handling.",
+            "MEDIUM"
+        ),
+        (
+            "ASSEMBLY",
+            r"\bassembly\b",
+            "Inline assembly detected. Manual review is recommended.",
+            "MEDIUM"
+        ),
+        (
+            "UNCHECKED_BLOCK",
+            r"\bunchecked\s*\{",
+            "Unchecked arithmetic block detected. Review overflow risks.",
+            "MEDIUM"
         )
-
-    # Delegatecall
-    if re.search(r'\.delegatecall\s*\(', source):
-        add_finding(
-            findings,
-            "HIGH",
-            "Delegatecall detected",
-            "Review target validation, storage layout and access controls."
-        )
-
-    # tx.origin
-    if re.search(r'\btx\.origin\b', source):
-        add_finding(
-            findings,
-            "MEDIUM",
-            "tx.origin usage",
-            "Review whether tx.origin is used for authorization."
-        )
-
-    # Selfdestruct
-    if re.search(r'\bselfdestruct\s*\(', source):
-        add_finding(
-            findings,
-            "HIGH",
-            "Selfdestruct detected",
-            "Review authorization and intended contract lifecycle."
-        )
-
-    # Dangerous low-level calls
-    if re.search(r'\.call\s*\(', source):
-        add_finding(
-            findings,
-            "MEDIUM",
-            "Low-level call detected",
-            "Check return-value handling and destination validation."
-        )
-
-    # Assembly
-    if re.search(r'\bassembly\b', source):
-        add_finding(
-            findings,
-            "INFO",
-            "Inline assembly detected",
-            "Manual review of memory and storage operations is advised."
-        )
-
-    # Unchecked blocks
-    if re.search(r'\bunchecked\s*\{', source):
-        add_finding(
-            findings,
-            "MEDIUM",
-            "Unchecked arithmetic",
-            "Review arithmetic operations for overflow and underflow."
-        )
-
-    # Sensitive functions without obvious modifiers
-    sensitive = [
-        "withdraw",
-        "mint",
-        "pause",
-        "setOwner",
-        "setAdmin",
-        "upgradeTo"
     ]
 
-    for function in sensitive:
-        pattern = (
-            r'function\s+' + re.escape(function) +
-            r'\s*\([^)]*\)[^{;]*\{'
-        )
+    for code, pattern, message, severity in checks:
+        if re.search(pattern, source, re.IGNORECASE):
+            findings.append({
+                "code": code,
+                "severity": severity,
+                "message": message
+            })
 
-        for match in re.finditer(pattern, source):
-            header = match.group(0)
+    sensitive_functions = re.findall(
+        r"function\s+([A-Za-z0-9_]+)\s*\([^)]*\)[^{;]*",
+        source,
+        re.IGNORECASE
+    )
 
-            if not re.search(
-                r'onlyOwner|onlyRole|onlyAdmin|'
-                r'hasRole|require\s*\(\s*msg\.sender',
-                header
-            ):
-                add_finding(
-                    findings,
-                    "MEDIUM",
-                    "Review access control: " + function,
-                    "No recognized access-control pattern was found "
-                    "in the function declaration."
-                )
+    for function_name in sensitive_functions:
+        if re.search(
+            r"(withdraw|transfer|mint|burn|pause|owner|admin|upgrade|rescue)",
+            function_name,
+            re.IGNORECASE
+        ):
+            declaration = re.search(
+                r"function\s+" + re.escape(function_name) +
+                r"\s*\([^)]*\)[^{;]*",
+                source,
+                re.IGNORECASE
+            )
 
-    # Older compiler versions
-    if re.search(r'pragma\s+solidity\s+0\.[0-7]\.', source):
-        add_finding(
-            findings,
-            "LOW",
-            "Older Solidity compiler",
-            "Review compiler compatibility and known compiler bugs."
-        )
+            if declaration:
+                signature = declaration.group(0)
+
+                if not re.search(
+                    r"\b(onlyOwner|onlyRole|onlyAdmin|private|internal)\b",
+                    signature,
+                    re.IGNORECASE
+                ):
+                    findings.append({
+                        "code": "ACCESS_CONTROL_REVIEW",
+                        "severity": "MEDIUM",
+                        "message": (
+                            "Sensitive function '" + function_name +
+                            "' has no obvious access modifier. "
+                            "Review its authorization logic."
+                        )
+                    })
+
+    if re.search(r"pragma\s+solidity\s+\^?0\.[0-7]\.", source):
+        findings.append({
+            "code": "OLD_SOLIDITY_VERSION",
+            "severity": "LOW",
+            "message": "Older Solidity compiler version detected."
+        })
 
     return findings
 
 
-def get_risk(findings):
-    severities = {item["severity"] for item in findings}
+def determine_risk(findings):
+    if not findings:
+        return "NO_FLAGS_FOUND"
+
+    severities = [item["severity"] for item in findings]
 
     if "HIGH" in severities:
         return "HIGH"
@@ -257,107 +310,212 @@ def get_risk(findings):
     if "MEDIUM" in severities:
         return "MEDIUM"
 
-    if "LOW" in severities:
-        return "LOW"
-
-    return "INFO"
+    return "LOW"
 
 
+# Scan one contract
 def scan_contract(contract):
-    address = contract["address"]
+    address = (
+        contract.get("address")
+        or contract.get("contractAddress")
+        or contract.get("contract_address")
+    )
 
-    report = {
-        "address": address,
-        "name": contract.get("name", "Unknown"),
-        "verified": True,
-        "source_available": False,
-        "status": "SOURCE_UNAVAILABLE",
-        "risk": "UNASSESSED",
-        "findings": [],
-        "explorer": (
-            "https://tronscan.org/#/contract/" + address
-        )
-    }
+    if not address:
+        return None
 
     source = fetch_contract_source(address)
 
-    if not source:
-        return report
+    report = {
+        "address": address,
+        "name": contract.get("name") or contract.get("contractName") or "Unknown",
+        "verified": True,
+        "source_available": bool(source),
+        "status": "ANALYZED" if source else "SOURCE_UNAVAILABLE",
+        "risk": "UNASSESSED",
+        "findings": [],
+        "source_code": source or None,
+        "explorer_url": "https://tronscan.org/#/contract/" + address,
+        "scanned_at": datetime.now(timezone.utc).isoformat()
+    }
 
-    report["source_available"] = True
-    report["status"] = "SCANNED"
+    if source:
+        report["findings"] = analyze_solidity(source)
+        report["risk"] = determine_risk(report["findings"])
 
-    findings = analyze_solidity(source)
-
-    report["findings"] = findings
-    report["risk"] = get_risk(findings)
-    report["finding_count"] = len(findings)
-
+    save_report(report)
     return report
 
 
+# Scan a small batch
+def scan_batch(start, limit=BATCH_SIZE):
+    contracts, metadata = fetch_verified_contracts(start, limit)
+    reports = []
+
+    for contract in contracts:
+        try:
+            report = scan_contract(contract)
+
+            if report:
+                reports.append(report)
+
+        except Exception as error:
+            address = (
+                contract.get("address")
+                or contract.get("contractAddress")
+                or "unknown"
+            )
+
+            reports.append({
+                "address": address,
+                "status": "SCAN_ERROR",
+                "risk": "UNASSESSED",
+                "error": str(error),
+                "scanned_at": datetime.now(timezone.utc).isoformat()
+            })
+
+    next_start = start + len(contracts)
+
+    if next_start >= MAX_TRONSCAN_INDEX or not contracts:
+        next_start = 0
+
+    return {
+        "reports": reports,
+        "start": start,
+        "next_start": next_start,
+        "contracts_returned": len(contracts),
+        "total_available": metadata.get("total", 0)
+    }
+
+
+# Dashboard
 @app.route("/")
 def home():
     return render_template("index.html")
 
 
-@app.route("/api/scan")
-def scan_batch():
-    try:
-        start = int(request.args.get("start", 0))
-        limit = int(request.args.get("limit", 5))
-
-        if start < 0 or start > MAX_START:
-            return jsonify({"error": "Invalid pagination offset."}), 400
-
-        if limit < 1 or limit > MAX_LIMIT:
-            return jsonify({
-                "error": "Batch size must be between 1 and 10."
-            }), 400
-
-        batch = fetch_verified_contracts(start, limit)
-
-        reports = []
-
-        for contract in batch["contracts"]:
-            reports.append(scan_contract(contract))
-            time.sleep(0.15)
-
+@app.route("/api/status")
+def api_status():
+    if not database_ready():
         return jsonify({
-            "network": "TRON Mainnet",
-            "total_verified": batch["total"],
-            "start": start,
-            "next_start": batch["next_start"],
-            "processed": len(reports),
-            "reports": reports
-        })
+            "ok": False,
+            "error": "Database is not configured."
+        }), 503
 
-    except requests.HTTPError as error:
-        status = (
-            error.response.status_code
-            if error.response is not None else 502
+    reports = get_saved_reports()
+
+    return jsonify({
+        "ok": True,
+        "saved_reports": len(reports),
+        "cursor": read_value("tron:cursor", 0),
+        "last_cron_run": read_value("tron:last_cron_run"),
+        "database": "connected"
+    })
+
+
+@app.route("/api/reports")
+def api_reports():
+    if not database_ready():
+        return jsonify({"error": "Database is not configured."}), 503
+
+    reports = get_saved_reports()
+
+    return jsonify({
+        "ok": True,
+        "count": len(reports),
+        "reports": reports
+    })
+
+
+@app.route("/api/report/<address>")
+def api_report(address):
+    if not database_ready():
+        return jsonify({"error": "Database is not configured."}), 503
+
+    report = read_value("tron:report:" + address)
+
+    if not report:
+        return jsonify({"error": "Report not found."}), 404
+
+    return jsonify(report)
+
+
+# Protected scheduled scanner
+@app.route("/api/cron", methods=["GET", "POST"])
+def cron_scan():
+    if not CRON_SECRET:
+        return jsonify({
+            "ok": False,
+            "error": "CRON_SECRET is not configured."
+        }), 503
+
+    auth_header = request.headers.get("Authorization", "")
+    expected = "Bearer " + CRON_SECRET
+
+    if not hmac.compare_digest(auth_header, expected):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    if not database_ready():
+        return jsonify({
+            "ok": False,
+            "error": "Upstash database is not configured."
+        }), 503
+
+    try:
+        cursor = int(read_value("tron:cursor", 0))
+        result = scan_batch(cursor, BATCH_SIZE)
+
+        save_value("tron:cursor", result["next_start"])
+        save_value(
+            "tron:last_cron_run",
+            datetime.now(timezone.utc).isoformat()
         )
 
         return jsonify({
-            "error": "TRONSCAN API request failed.",
-            "upstream_status": status
-        }), 502
+            "ok": True,
+            "message": "Scheduled scan completed.",
+            "start": result["start"],
+            "next_start": result["next_start"],
+            "scanned": len(result["reports"]),
+            "reports": result["reports"]
+        })
 
-    except requests.RequestException:
+    except Exception as error:
         return jsonify({
-            "error": "Unable to connect to TRONSCAN."
-        }), 502
+            "ok": False,
+            "error": str(error)
+        }), 500
 
-    except (ValueError, TypeError):
+
+# Optional manual batch endpoint
+@app.route("/api/scan")
+def api_scan():
+    if not database_ready():
+        return jsonify({"error": "Database is not configured."}), 503
+
+    try:
+        start = int(request.args.get("start", 0))
+        limit = int(request.args.get("limit", BATCH_SIZE))
+
+        if start < 0 or start >= MAX_TRONSCAN_INDEX:
+            return jsonify({"error": "Invalid start position."}), 400
+
+        if limit < 1 or limit > 10:
+            return jsonify({"error": "Limit must be between 1 and 10."}), 400
+
+        result = scan_batch(start, limit)
+
         return jsonify({
-            "error": "Invalid request parameters."
-        }), 400
+            "ok": True,
+            **result
+        })
 
-
-@app.errorhandler(500)
-def server_error(error):
-    return jsonify({"error": "Internal server error."}), 500
+    except Exception as error:
+        return jsonify({
+            "ok": False,
+            "error": str(error)
+        }), 500
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5000, debug=False)
