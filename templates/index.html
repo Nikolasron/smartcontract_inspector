@@ -3,70 +3,105 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Smart Contract Security Scanner</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#080d18">
+    <title>TRON Contract Intelligence</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 
-    <header>
-        <h1>Smart Contract Security Scanner</h1>
-        <p>Automated Solidity Security Analysis</p>
-    </header>
+<header>
+    <h1>TRON Contract Intelligence</h1>
+    <p>Automated Verified Contract Security Scanner</p>
+    <span id="systemStatus">Connecting to TRONSCAN...</span>
+</header>
 
-    <main class="container">
+<main class="container">
 
-        <section class="scanner">
-            <h2>Scan Smart Contract</h2>
+    <section class="stats">
+        <article>
+            <h3>Verified Contracts</h3>
+            <strong id="totalContracts">Loading...</strong>
+        </article>
 
-            <form id="scanForm">
-                <label for="contract">Paste Solidity Contract Code</label>
+        <article>
+            <h3>Processed</h3>
+            <strong id="processed">0</strong>
+        </article>
 
-                <textarea
-                    id="contract"
-                    name="contract"
-                    placeholder="Paste your Solidity smart contract code here..."
-                    required
-                ></textarea>
+        <article>
+            <h3>High Risk</h3>
+            <strong id="highRisk">0</strong>
+        </article>
 
-                <button type="submit" id="scanButton">
-                    Scan Contract
-                </button>
-            </form>
-        </section>
+        <article>
+            <h3>Medium Risk</h3>
+            <strong id="mediumRisk">0</strong>
+        </article>
+    </section>
 
-        <section class="results">
-            <h2>Security Analysis Results</h2>
+    <section class="scanner">
+        <h2>Automatic Discovery</h2>
+        <p>
+            The system automatically discovers verified TRON
+            contracts and analyzes available source code.
+        </p>
 
-            <div id="loading" hidden>
-                Scanning contract...
-            </div>
+        <div class="progress">
+            <div id="progressBar"></div>
+        </div>
 
-            <div id="results">
-                <p>Your scan results will appear here.</p>
-            </div>
-        </section>
+        <p id="progressText">Waiting for automatic discovery...</p>
+        <p id="scanActivity">Initializing scanner...</p>
+    </section>
 
-        <section class="features">
-            <h2>Detection Capabilities</h2>
+    <section class="results">
+        <h2>Discovered Contracts</h2>
 
-            <ul>
-                <li>Reentrancy vulnerabilities</li>
-                <li>Unsafe external calls</li>
-                <li>Missing access controls</li>
-                <li>Unchecked return values</li>
-                <li>Integer overflow and underflow patterns</li>
-                <li>Dangerous Solidity functions</li>
-            </ul>
-        </section>
+        <input
+            type="search"
+            id="searchInput"
+            placeholder="Search contract name or address..."
+        >
 
-    </main>
+        <div class="table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Contract</th>
+                        <th>Address</th>
+                        <th>Risk</th>
+                        <th>Status</th>
+                        <th>Report</th>
+                    </tr>
+                </thead>
 
-    <footer>
-        <p>Smart Contract Security Scanner | Security Research Tool</p>
-    </footer>
+                <tbody id="contractResults">
+                    <tr>
+                        <td colspan="5">
+                            Automatically discovering contracts...
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
 
-    <script src="/static/script.js"></script>
+    <section class="results">
+        <h2>Individual Security Report</h2>
+        <div id="report">
+            Reports will appear automatically as contracts are analyzed.
+        </div>
+    </section>
+
+</main>
+
+<footer>
+    TRON Contract Intelligence |
+    Automated Security Research
+</footer>
+
+<script src="/static/script.js"></script>
 
 </body>
 </html>
